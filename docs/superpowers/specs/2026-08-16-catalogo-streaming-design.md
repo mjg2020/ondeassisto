@@ -501,8 +501,8 @@ Domínio `ondeassisto.com.br` apontado nas configurações do projeto. Plano Hob
 
 | # | Item | Tipo | Responsável |
 |---|---|---|---|
-| 1 | Regerar o `TMDB_READ_TOKEN`, já que o valor atual trafegou por histórico de conversa | `[DECIDIR]` | Mauricio |
-| 2 | Rodar o teste de contrato (§9.3) e converter os quatro pontos em fato | `[ADAPTAR]` | implementação |
+| 1 | ~~Regerar o `TMDB_READ_TOKEN`~~ — **resolvido em 16/08/2026.** Token novo autentica (HTTP 200); o anterior retorna HTTP 401 / `status_code 7` | — | concluído |
+| 2 | Rodar o teste de contrato (§9.3). **Item 1 confirmado em 16/08/2026** contra a API ao vivo: 20 resultados por página; Netflix BR = 4.891 títulos em 245 páginas, dentro do teto de 500. Restam os itens 2 a 7 | `[ADAPTAR]` | implementação |
 | 3 | Escolher a fonte tipográfica do tema escuro | `[DECIDIR]` | implementação |
 | 4 | Definir o conjunto inicial de provedores destacados na UI, a partir de `display_priorities.BR` | `[ADAPTAR]` | implementação |
 | 5 | Verificar `/3/search/movie` em fonte primária e acrescentá-lo à ficha técnica — hoje é o único endpoint usado pelo spec que a ficha não cobre | `[ADAPTAR]` | implementação |
