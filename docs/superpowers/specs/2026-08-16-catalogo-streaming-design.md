@@ -26,7 +26,7 @@ Fonte de dados: **API do TMDB**, `watch_region=BR`, metadados em `pt-BR`. Os dad
 ### Dentro
 
 - Grade de filmes filtrada por provedor, gênero, ano, nota e ordenação — com estado na URL
-- Busca por título, permanente no cabeçalho
+- Busca por título, permanente no cabeçalho — com semântica própria, ver §3.7
 - Página de detalhe por filme, com URL própria, renderizada no servidor
 - Watchlist pessoal em `localStorage`, sem login
 - Tema escuro ("cinema"), responsivo
@@ -69,7 +69,9 @@ Default: `with_watch_monetization_types=flatrate`. "Disponível no meu streaming
 
 O TMDB não aplica correção bayesiana a `vote_average` no `/discover`. Ordenar por nota sem piso enche o topo de títulos obscuros com 1–3 votos.
 
-**Regra:** `sort_by=vote_average.desc` é sempre acompanhado de `vote_count.gte=200`. O piso não é configurável pelo usuário no v1.
+**Regra:** `vote_count.gte=200` acompanha **toda requisição em que `vote_average` participe** — seja como ordenação (`sort_by=vote_average.desc`), seja como filtro (`vote_average.gte`).
+
+O piso está amarrado ao **dado**, não à ordenação. Filtrar "nota mínima 7" sem piso de votos admitiria um filme com um único voto 10 exatamente como o topo da lista admitia — o efeito é menos visível (com `popularity.desc` esses títulos não sobem ao topo), mas polui a cauda e infla a contagem de resultados. O piso não é configurável pelo usuário no v1.
 
 ### 3.5 Sem selo de provedor na grade
 
@@ -82,6 +84,21 @@ O TMDB não aplica correção bayesiana a `vote_average` no `/discover`. Ordenar
 ### 3.6 Watchlist local, com snapshot
 
 `localStorage`, schema versionado. Guarda um **snapshot mínimo** do filme (id, título, `poster_path`, ano), não apenas o id — assim `/minha-lista` renderiza sem disparar uma chamada por item salvo.
+
+### 3.7 A busca é um caminho separado do catálogo
+
+A grade e a busca respondem a perguntas diferentes e **não compartilham semântica**.
+
+- A **grade** responde "o que tem nos meus serviços" — e por isso é construída sobre `/discover/movie`, o único endpoint que aceita filtro por provedor
+- A **busca** responde "esse filme, onde está" — e cobre o catálogo **inteiro**, não apenas os serviços marcados
+
+**Decisão:** a busca por título **ignora o filtro de serviços**. O resultado mostra qualquer filme que casar com o termo; a disponibilidade aparece apenas ao abrir a página do filme.
+
+**Motivo:** os parâmetros de watch provider (`with_watch_providers`, `watch_region`, `with_watch_monetization_types`) existem em `/discover`. Anotar cada resultado de busca com sua disponibilidade exigiria uma chamada por resultado — exatamente o N+1 rejeitado em §3.5.
+
+**Consequência assumida:** o usuário pode buscar um filme que não está em nenhum serviço que ele assina. A UI avisa isso no cabeçalho do resultado, em vez de fingir que a busca respeita o filtro.
+
+> **Pendência de verificação:** o endpoint `/3/search/movie` **não está coberto pela ficha técnica**. Seus parâmetros aceitos precisam ser verificados em fonte primária antes da implementação — ver §9.3 item 5 e §13 item 5. A decisão acima é sólida em qualquer cenário (mesmo que a busca aceitasse filtro por provedor, a semântica escolhida continua sendo a mais útil), mas o spec não afirma o que a ficha não sustenta.
 
 ---
 
@@ -100,8 +117,13 @@ flowchart TD
     T1 --> G
     G -->|HTML| B
 
+    B -->|"GET /busca?q=matrix"| S["Server Component: busca"]
+    S --> T5["TMDB /search/movie"]
+    T5 --> S
+    S -->|HTML| B
+
     B -->|"GET /filme/550"| D["Server Component: detalhe (SSR + ISR)"]
-    D --> T2["TMDB /movie/550"]
+    D --> T2["TMDB /movie/550?append_to_response=credits,videos"]
     D --> T3["TMDB /movie/550/watch/providers"]
     T2 --> D
     T3 --> D
@@ -120,11 +142,14 @@ flowchart TD
 
 | Rota | Renderização | Observações |
 |---|---|---|
-| `/` | Server Component | Grade. Lê `searchParams`, chama TMDB, devolve HTML |
-| `/filme/[id]` | Server Component + ISR | `generateMetadata` produz OG tags para preview e indexação |
+| `/` | Server Component | Grade. Lê `searchParams`, chama TMDB, devolve HTML. `loading.tsx` com skeleton |
+| `/busca` | Server Component | Busca por título (§3.7). Lê `q`, ignora filtro de serviços. `loading.tsx` com skeleton |
+| `/filme/[id]` | Server Component + ISR | `generateMetadata` produz OG tags para preview e indexação. `loading.tsx` com skeleton |
 | `/minha-lista` | Client Component | Lê `localStorage`. Não toca no servidor |
 | `/sobre` | Estática | Atribuição TMDB e JustWatch, aviso legal |
 | `/api/discover` | Route handler | Existe apenas para o scroll infinito (páginas 2+) |
+
+A grade fica sob `Suspense` chaveado por `searchParams`, para que o skeleton reapareça a cada troca de filtro — sem isso, clicar num chip deixa a tela congelada até a navegação de servidor concluir.
 
 ### 4.2 Por que página em vez de modal
 
@@ -143,7 +168,8 @@ Modal seria mais barato, mas não tem URL, logo não existe para o buscador.
 | `/configuration` | 24 h | Valores efetivamente estáticos |
 | `/watch/providers/movie?watch_region=BR` | 24 h | Lista de provedores muda raramente |
 | `/discover/movie` | 1 h | Equilíbrio entre frescor e volume de chamadas |
-| `/movie/{id}` | 24 h | Metadados mudam pouco |
+| `/search/movie` | 1 h | Mesmo perfil de volatilidade da grade |
+| `/movie/{id}` | 24 h | Metadados, elenco e trailer mudam pouco — vêm na mesma resposta |
 | `/movie/{id}/watch/providers` | 6 h | Disponibilidade é o dado mais volátil |
 
 Implementado via `revalidate` do Next (Vercel Data Cache).
@@ -162,10 +188,13 @@ Implementado via `revalidate` do Next (Vercel Data Cache).
 |---|---|---|
 | `client.ts` | `fetchTmdb(path, params, opts)`. Header `Authorization: Bearer`, `language=pt-BR`, timeout, backoff no 429, erros tipados por `status_code` | — |
 | `discover.ts` | `discoverMovies(filtros, page)` → resultados normalizados + `totalPages` limitado a 500 | `client` |
-| `movie.ts` | `getMovie(id)`, `getMovieProviders(id)` → ofertas do bucket `BR` | `client` |
-| `providers.ts` | `getBrProviders()` → lista viva ordenada por `display_priorities.BR` | `client` |
-| `images.ts` | `posterUrl(path, size)`, `logoUrl(path, size)` a partir de `secure_base_url` | `client` |
+| `movie.ts` | `getMovie(id)` — chamada única com `append_to_response=credits,videos` (metadados + elenco + trailer); `getMovieProviders(id)` → ofertas do bucket `BR` | `client` |
+| `search.ts` | `searchMovies(termo, page)` → resultados normalizados. Não aceita filtro de serviços (§3.7) | `client` |
+| `providers.ts` | `getBrProviders()` → lista viva ordenada por `display_priorities.BR` **ascendente — menor valor = posição mais alta** | `client` |
+| `images.ts` | `posterUrl(path, size)`, `backdropUrl(path, size)`, `logoUrl(path, size)` a partir de `secure_base_url` | `client` |
 | `types.ts` | Tipos do domínio (`Filme`, `Oferta`, `Provedor`) — não tipos crus da API | — |
+
+**Sobre o `append_to_response` em `getMovie`:** `credits` e `videos` são sub-requests do mesmo namespace, e `videos` é o exemplo literal da documentação. A página de detalhe continua sendo **duas** chamadas HTTP. Isso **não** vale para `watch/providers`, que segue em chamada separada até o teste de contrato rodar (§9.3 item 3). O suporte a `credits` é suposição — ver §9.3 item 4.
 
 **Autenticação:** header `Authorization: Bearer <TMDB_READ_TOKEN>`. É o método documentado como padrão pelo TMDB e o único presente no OpenAPI oficial. Não usar o parâmetro `api_key` na query string — funciona igual, mas vaza em log de proxy, CDN e `Referer`.
 
@@ -181,6 +210,8 @@ Puro, sem I/O. É a camada de maior risco de regressão silenciosa e a mais fác
 - Provedores usam **pipe (`|`) = OR**. Vírgula significaria "está na Netflix **e** no Prime ao mesmo tempo", que casa com quase nada
 - `watch_region=BR` é sempre incluído. **Enviar `with_watch_providers` sem `watch_region` devolve resultados não filtrados, silenciosamente, com HTTP 200** — é o modo de falha mais perigoso da API
 - `page` é limitado a 500 antes de qualquer chamada
+- **Valor inválido é descartado e cai no default**, nunca gera erro. Vale para todos os parâmetros: `ordem` desconhecida vira `popularidade`, `ano` fora de faixa é ignorado, `servicos` com id não numérico é descartado. Uma URL vinda de link antigo ou adulterada renderiza a grade, não uma tela de erro
+- **Home sem `servicos`**: nenhum filtro de provedor é aplicado — a grade mostra o catálogo geral do TMDB para o Brasil. Ausência de parâmetro significa "sem filtro", como em todos os demais campos
 
 ### 5.3 `lib/watchlist/` — exclusivamente cliente
 
@@ -193,7 +224,7 @@ Puro, sem I/O. É a camada de maior risco de regressão silenciosa e a mais fác
 
 ### 5.4 `components/`
 
-`FilterBar` (escreve na URL, sem estado próprio) · `MovieGrid` · `MovieCard` · `InfiniteLoader` · `MovieDetail` · `ProviderOffers` · `WatchlistButton` · `Attribution` · `EmptyState` · `ErrorState`.
+`FilterBar` (escreve na URL, sem estado próprio) · `SearchBar` (cabeçalho permanente, navega para `/busca`) · `MovieGrid` · `MovieCard` · `InfiniteLoader` · `MovieDetail` · `CastList` · `TrailerEmbed` · `ProviderOffers` · `WatchlistButton` · `Attribution` · `EmptyState` · `ErrorState` · `GridSkeleton` · `DetailSkeleton`.
 
 ---
 
@@ -208,11 +239,22 @@ Puro, sem I/O. É a camada de maior risco de regressão silenciosa e a mais fác
 | monetização | `incluirGratis=1` | `with_watch_monetization_types=flatrate` ou `flatrate\|free\|ads` |
 | gênero | `genero=28` | `with_genres=28` |
 | ano | `ano=2024` | `primary_release_year=2024` |
-| nota mínima | `nota=7` | `vote_average.gte=7` |
-| ordenação | `ordem=nota` | `sort_by=vote_average.desc` **+ `vote_count.gte=200`** |
+| nota mínima | `nota=7` | `vote_average.gte=7` **+ `vote_count.gte=200`** |
+| ordenação | `ordem=nota` | ver tabela abaixo |
+| busca (rota `/busca`) | `q=matrix` | `query=matrix` — **sem** parâmetros de provedor (§3.7) |
 | página | — | `page` (limitado a 500) |
 
 Sempre presentes: `language=pt-BR`, `include_adult=false`, `include_video=false`.
+
+**Vocabulário de `ordem` — valores aceitos, exaustivo:**
+
+| `ordem=` | `sort_by` | Acompanhamento obrigatório |
+|---|---|---|
+| `popularidade` **(default)** | `popularity.desc` | — |
+| `nota` | `vote_average.desc` | `vote_count.gte=200` |
+| `recentes` | `primary_release_date.desc` | `primary_release_date.lte=<hoje>`, para excluir não lançados |
+
+Qualquer outro valor é descartado e cai no default (§5.2). O vocabulário é fechado porque §3.2 torna cada combinação uma URL indexável — mudá-lo depois custa caro.
 
 ### 6.2 Ofertas de um filme
 
@@ -220,6 +262,7 @@ Sempre presentes: `language=pt-BR`, `include_adult=false`, `include_video=false`
 
 - `link` — URL da página `/watch` do próprio TMDB (não é deep link do provedor)
 - `flatrate`, `rent`, `buy`, `ads` — **presentes apenas quando há oferta daquele tipo**. Null-check obrigatório em cada chave
+- `free` é valor válido de `with_watch_monetization_types`, mas **não aparece como chave** no exemplo oficial da documentação (95 buckets de país; o bucket BR de Fight Club traz apenas `{link, flatrate}`). Ler `free` defensivamente junto com `ads`, e nunca inferir ausência de disponibilidade a partir da ausência de uma chave conhecida — ver §9.3 item 6
 - Cada provedor traz 4 campos: `provider_id`, `provider_name`, `logo_path`, `display_priority`
 
 ### 6.3 Provedores
@@ -228,7 +271,7 @@ Obtidos de `/watch/providers/movie?watch_region=BR`. **Nunca fixados em código.
 
 Dois motivos concretos:
 
-- **HBO Max** aparece como `384` no exemplo da documentação, mas a lista viva do BR traz `1899` — e `384` não aparece nela
+- **HBO Max** aparece como `384` no exemplo da documentação, mas a lista viva do BR traz `1899` — e `384` não aparece nela. A observação vem da página de browse da TMDB, não de chamada direta à API; confirmar via API (§9.3 item 2)
 - **Amazon Prime Video** tem dois IDs (`9` e `119`), com o mesmo `logo_path`
 
 **Regra:** o casamento marca↔provedor é feito por **conjunto de IDs**, nunca por ID único.
@@ -241,7 +284,10 @@ URL montada com três peças: `secure_base_url` + tamanho + `file_path`.
 
 - Base: `https://image.tmdb.org/t/p/`
 - Pôsteres: `w92`, `w154`, `w185`, `w342`, `w500`, `w780`, `original`
+- Backdrops: `w300`, `w780`, `w1280`, `original`
 - Logos: `w45`, `w92`, `w154`, `w185`, `w300`, `w500`, `original`
+
+**Os três conjuntos são distintos e não intercambiáveis.** `w500` é tamanho válido de pôster e **não existe** em `backdrop_sizes` — usar o palpite errado devolve 404 justamente no elemento visualmente dominante da página de detalhe.
 
 **Logos de provedor são `.jpg`** — retângulos opacos, sem transparência. O card precisa ser desenhado contando com isso, não com PNG recortado.
 
@@ -255,6 +301,17 @@ Tema **escuro "cinema"**: fundo quase preto, acento âmbar, pôster como element
 - Nota sobreposta ao canto do pôster
 - Chips de provedor no topo, ativos em âmbar
 - Página de detalhe com backdrop no topo e pôster sobreposto
+
+### 7.1 Acessibilidade — critérios verificáveis
+
+O tema escolhido compromete o produto com as duas construções de maior risco de contraste: âmbar sobre quase preto, e texto sobreposto a capa arbitrária. Por isso os critérios abaixo são medidos, não estimados:
+
+1. **Contraste mínimo 4.5:1** para texto e **3:1** para bordas de controle. Os hexadecimais do fundo e do âmbar são fixados e medidos **antes** de pintar a UI, não depois
+2. **A nota fica em pílula de fundo sólido opaco**, nunca sobre a imagem crua — contraste sobre capa arbitrária é indeterminado por definição
+3. **`alt` do pôster = título do filme.** O placeholder de `poster_path` null tem `alt` próprio, descrevendo a ausência
+4. **Chips de provedor são `button`** com estado ativo programático (não apenas cor) e anel de foco visível
+
+`aria-live` nos resultados e tamanho de alvo de toque ficam como critério de implementação.
 
 ---
 
@@ -272,6 +329,7 @@ Tema **escuro "cinema"**: fundo quase preto, acento âmbar, pôster como element
 | `localStorage` indisponível | Watchlist degrada para memória de sessão, com aviso |
 | Falha parcial no detalhe | São **duas** chamadas. Se as ofertas falharem, renderizar o filme sem elas |
 | Resultado vazio | Estado vazio explícito, com sugestão de afrouxar filtros |
+| Requisição em andamento | Skeleton na proporção 2:3, via `loading.tsx` + `Suspense`. O chip clicado fica em estado pendente até a navegação concluir — com backoff de até 3 tentativas no 429, isso pode levar segundos, e a tela não pode ficar congelada sem sinal |
 
 **Limite de taxa:** o teto do TMDB é *soft*, na faixa de 40 requisições por segundo, e pode mudar sem aviso. Não há cota diária. O app respeita o 429 e não tenta contorná-lo.
 
@@ -282,8 +340,10 @@ Tema **escuro "cinema"**: fundo quase preto, acento âmbar, pôster como element
 ### 9.1 Unitários
 
 - `lib/filters` — serialização pipe vs vírgula, defaults, entrada hostil na URL, limite de 500
-- `lib/tmdb/images` — montagem das três peças
-- `lib/watchlist` — migração de schema, cota estourada, `localStorage` ausente
+- `lib/filters` — vocabulário fechado de `ordem`: cada valor mapeia para o `sort_by` correto e arrasta seu acompanhamento obrigatório; valor desconhecido cai no default sem erro
+- Piso de votos aplicado nos **dois** casos em que `vote_average` participa: ordenação e filtro de nota mínima
+- `lib/tmdb/images` — montagem das três peças, nas três famílias de tamanho (pôster, backdrop, logo), incluindo a rejeição de `w500` como backdrop
+- `lib/watchlist` — migração de schema, cota estourada, `localStorage` ausente, JSON corrompido, `v` desconhecido
 - Casamento de provedor por conjunto de IDs
 
 ### 9.2 Integração
@@ -292,14 +352,17 @@ Rotas com TMDB mockado por **fixtures capturadas de resposta real**, não invent
 
 ### 9.3 Teste de contrato — roda sob demanda, fora do CI, com chave real
 
-Existe para converter em fato o que hoje é suposição. Cada item abaixo está marcado como não verificado na ficha técnica:
+Existe para converter em fato o que hoje é suposição. Os itens 1, 3, 4, 5, 6 e 7 estão marcados como não verificados na ficha técnica; o item 2 está confirmado por observação da página de browse BR, mas **não** por chamada direta à API.
 
 1. **20 resultados por página** — comportamento observado, não documentado. O teto de ~10.000 resultados deriva dele
-2. **`provider_id` do HBO Max vivo em BR** — `384` (doc) vs `1899` (lista viva)
+2. **`provider_id` do HBO Max vivo em BR** — `384` (doc) vs `1899` (browse)
 3. **`append_to_response=watch/providers`** — não documentado; há relato de divergência com o endpoint direto. Se passar, reduz a página de detalhe de duas chamadas para uma
-4. **Semântica da vírgula (`AND`)** em `with_watch_providers`
+4. **`credits` e `videos` como valores de `append_to_response`** em `/movie/{id}` — a documentação só exemplifica `videos` e `videos,images`. Se `credits` reprovar, o detalhe vira três chamadas e a linha "falha parcial" do §8 ganha uma terceira dimensão
+5. **Parâmetros aceitos por `/3/search/movie`** — o endpoint **não está coberto pela ficha técnica**. Verificar antes de implementar §3.7, e acrescentar o resultado à ficha
+6. **A chave `free` aparece no bucket BR** de um título casado por `with_watch_monetization_types=free`?
+7. **Semântica da vírgula (`AND`)** em `with_watch_providers`
 
-Enquanto este teste não rodar, esses quatro pontos permanecem suposição, e o código assume o caminho conservador (duas chamadas no detalhe, provedores lidos da API).
+Enquanto este teste não rodar, esses pontos permanecem suposição, e o código assume o caminho conservador (chamada separada para ofertas, provedores lidos da API, chaves de monetização lidas defensivamente).
 
 ### 9.4 E2E (Playwright)
 
@@ -372,6 +435,12 @@ Os campos retornados são: `adult`, `backdrop_path`, `genre_ids`, `id`, `origina
 
 O catálogo de um provedor individual no Brasil cabe nesse limite. "Todos os filmes de todos os serviços" não cabe. O scroll infinito informa o fim de forma explícita, em vez de simular que acabou. Contorno conhecido, para v2: fatiar a consulta por janelas de data com `primary_release_date.gte/lte`.
 
+### 11.4 O filtro por provedor só existe no `/discover`
+
+Os três parâmetros de disponibilidade — `with_watch_providers`, `watch_region`, `with_watch_monetization_types` — pertencem ao `/discover`. Não há lookup reverso nos endpoints de watch provider: **`/discover/movie` é o único caminho prático para enumerar o catálogo de um provedor numa região.**
+
+É a razão estrutural de §3.7: a busca por título não tem como respeitar o filtro de serviços numa única chamada, e anotá-la resultado a resultado recairia no N+1 rejeitado em §3.5.
+
 ---
 
 ## 12. Configuração e implantação
@@ -404,6 +473,8 @@ Domínio `ondeassisto.com.br` apontado nas configurações do projeto. Plano Hob
 | 2 | Rodar o teste de contrato (§9.3) e converter os quatro pontos em fato | `[ADAPTAR]` | implementação |
 | 3 | Escolher a fonte tipográfica do tema escuro | `[DECIDIR]` | implementação |
 | 4 | Definir o conjunto inicial de provedores destacados na UI, a partir de `display_priorities.BR` | `[ADAPTAR]` | implementação |
+| 5 | Verificar `/3/search/movie` em fonte primária e acrescentá-lo à ficha técnica — hoje é o único endpoint usado pelo spec que a ficha não cobre | `[ADAPTAR]` | implementação |
+| 6 | Decidir o agrupamento marca↔IDs: revendas ("Telecine Amazon Channel") entram no chip da marca-mãe? "Apple TV" e "Apple TV Plus" são o mesmo chip? Transacionais puros ficam fora, por coerência com §3.3? | `[DECIDIR]` | Mauricio |
 
 ---
 
