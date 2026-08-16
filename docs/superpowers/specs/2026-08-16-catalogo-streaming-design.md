@@ -92,11 +92,24 @@ A grade e a busca respondem a perguntas diferentes e **não compartilham semânt
 - A **grade** responde "o que tem nos meus serviços" — e por isso é construída sobre `/discover/movie`, o único endpoint que aceita filtro por provedor
 - A **busca** responde "esse filme, onde está" — e cobre o catálogo **inteiro**, não apenas os serviços marcados
 
-**Decisão:** a busca por título **ignora o filtro de serviços**. O resultado mostra qualquer filme que casar com o termo; a disponibilidade aparece apenas ao abrir a página do filme.
+**Decisão, em três partes:**
 
-**Motivo:** os parâmetros de watch provider (`with_watch_providers`, `watch_region`, `with_watch_monetization_types`) existem em `/discover`. Anotar cada resultado de busca com sua disponibilidade exigiria uma chamada por resultado — exatamente o N+1 rejeitado em §3.5.
+1. **A busca não filtra por serviço.** Esconder um resultado porque ele não está na sua assinatura seria o pior comportamento possível — quem digita o nome de um filme quer saber onde ele está, inclusive quando a resposta é "em nenhum lugar seu"
+2. **A busca anota a disponibilidade.** Cada resultado exibido recebe o selo dos serviços onde está, buscado por `/movie/{id}/watch/providers`
+3. **Resultados nos serviços marcados aparecem primeiro**, com o selo destacado; os demais vêm abaixo, sob um separador que diz explicitamente que não estão na sua assinatura
 
-**Consequência assumida:** o usuário pode buscar um filme que não está em nenhum serviço que ele assina. A UI avisa isso no cabeçalho do resultado, em vez de fingir que a busca respeita o filtro.
+**Por que aqui o N+1 é aceitável, e na grade não.** Os perfis de custo são diferentes o bastante para justificar decisões opostas:
+
+| | Grade (§3.5) | Busca |
+|---|---|---|
+| Itens por carga | 20, com scroll infinito | os da primeira página, **limitado a 10** |
+| Frequência | toda navegação e troca de filtro | ação deliberada do usuário |
+| Intenção | passeio | alta — a pessoa quer **este** filme |
+| Custo por interação | 20 chamadas, repetidas indefinidamente | até 10 chamadas, uma vez, disparadas em paralelo |
+
+Com TTL de 6 h em `/movie/{id}/watch/providers` (§4.3), buscas repetidas do mesmo título saem do cache. O teto do TMDB é de aproximadamente 40 requisições por segundo (§8) — dez chamadas paralelas por busca cabem com folga numa escala pessoal.
+
+**Limite explícito:** apenas os primeiros 10 resultados são anotados. Do 11º em diante o selo não aparece, e a UI diz isso — o usuário refina o termo. Silenciosamente não anotar seria pior do que admitir o corte.
 
 > **Pendência de verificação:** o endpoint `/3/search/movie` **não está coberto pela ficha técnica**. Seus parâmetros aceitos precisam ser verificados em fonte primária antes da implementação — ver §9.3 item 5 e §13 item 5. A decisão acima é sólida em qualquer cenário (mesmo que a busca aceitasse filtro por provedor, a semântica escolhida continua sendo a mais útil), mas o spec não afirma o que a ficha não sustenta.
 
@@ -143,7 +156,7 @@ flowchart TD
 | Rota | Renderização | Observações |
 |---|---|---|
 | `/` | Server Component | Grade. Lê `searchParams`, chama TMDB, devolve HTML. `loading.tsx` com skeleton |
-| `/busca` | Server Component | Busca por título (§3.7). Lê `q`, ignora filtro de serviços. `loading.tsx` com skeleton |
+| `/busca` | Server Component | Busca por título (§3.7). Lê `q`; não filtra por serviço, mas anota disponibilidade nos 10 primeiros e ordena os marcados à frente. `loading.tsx` com skeleton |
 | `/filme/[id]` | Server Component + ISR | `generateMetadata` produz OG tags para preview e indexação. `loading.tsx` com skeleton |
 | `/minha-lista` | Client Component | Lê `localStorage`. Não toca no servidor |
 | `/sobre` | Estática | Atribuição TMDB e JustWatch, aviso legal |
@@ -189,7 +202,7 @@ Implementado via `revalidate` do Next (Vercel Data Cache).
 | `client.ts` | `fetchTmdb(path, params, opts)`. Header `Authorization: Bearer`, `language=pt-BR`, timeout, backoff no 429, erros tipados por `status_code` | — |
 | `discover.ts` | `discoverMovies(filtros, page)` → resultados normalizados + `totalPages` limitado a 500 | `client` |
 | `movie.ts` | `getMovie(id)` — chamada única com `append_to_response=credits,videos` (metadados + elenco + trailer); `getMovieProviders(id)` → ofertas do bucket `BR` | `client` |
-| `search.ts` | `searchMovies(termo, page)` → resultados normalizados. Não aceita filtro de serviços (§3.7) | `client` |
+| `search.ts` | `searchMovies(termo, page)` → resultados normalizados, **anotados com disponibilidade** para os 10 primeiros via `getMovieProviders` em paralelo, e particionados em "nos seus serviços" / "fora" (§3.7) | `client`, `movie` |
 | `providers.ts` | `getBrProviders()` → lista viva ordenada por `display_priorities.BR` **ascendente — menor valor = posição mais alta** | `client` |
 | `images.ts` | `posterUrl(path, size)`, `backdropUrl(path, size)`, `logoUrl(path, size)` a partir de `secure_base_url` | `client` |
 | `types.ts` | Tipos do domínio (`Filme`, `Oferta`, `Provedor`) — não tipos crus da API | — |
@@ -298,20 +311,37 @@ URL montada com três peças: `secure_base_url` + tamanho + `file_path`.
 Tema **escuro "cinema"**: fundo quase preto, acento âmbar, pôster como elemento dominante. A interface recua para que a capa apareça.
 
 - Grade responsiva de pôsteres em proporção 2:3
-- Nota sobreposta ao canto do pôster
+- Título e ano **abaixo** da imagem, no corpo do card — nunca sobrepostos (§7.1)
+- Nota em pílula âmbar opaca no canto do pôster — a única sobreposição permitida
 - Chips de provedor no topo, ativos em âmbar
 - Página de detalhe com backdrop no topo e pôster sobreposto
 
 ### 7.1 Acessibilidade — critérios verificáveis
 
-O tema escolhido compromete o produto com as duas construções de maior risco de contraste: âmbar sobre quase preto, e texto sobreposto a capa arbitrária. Por isso os critérios abaixo são medidos, não estimados:
+Tema escuro é o padrão fácil de errar em contraste. A paleta abaixo está **medida**, não estimada — os valores são razões de contraste WCAG contra o fundo `#0b0b0f`:
 
-1. **Contraste mínimo 4.5:1** para texto e **3:1** para bordas de controle. Os hexadecimais do fundo e do âmbar são fixados e medidos **antes** de pintar a UI, não depois
-2. **A nota fica em pílula de fundo sólido opaco**, nunca sobre a imagem crua — contraste sobre capa arbitrária é indeterminado por definição
-3. **`alt` do pôster = título do filme.** O placeholder de `poster_path` null tem `alt` próprio, descrevendo a ausência
-4. **Chips de provedor são `button`** com estado ativo programático (não apenas cor) e anel de foco visível
+| Papel | Hex | Contraste | Exigido | Situação |
+|---|---|---|---|---|
+| Fundo | `#0b0b0f` | — | — | referência |
+| Texto primário | `#f2f2f4` | **17,6:1** | 4,5:1 | passa AAA |
+| Texto secundário (ano, metadados) | `#9a9aa6` | **7,1:1** | 4,5:1 | passa AAA |
+| Âmbar (acento, chip ativo, nota) | `#f5c518` | **12,1:1** | 4,5:1 | passa AAA |
+| Texto escuro sobre âmbar | `#0b0b0f` sobre `#f5c518` | **12,1:1** | 4,5:1 | passa AAA |
 
-`aria-live` nos resultados e tamanho de alvo de toque ficam como critério de implementação.
+A paleta inteira passa em AAA com folga. Isso não é sorte: âmbar saturado sobre preto é uma das poucas combinações escuras que resolve contraste e identidade ao mesmo tempo. **Qualquer alteração desses hexadecimais exige medir de novo** — escurecer o âmbar para "suavizar" é a forma mais provável de quebrar a conformidade sem perceber.
+
+**Decisão estrutural: o texto não fica sobre o pôster.** Título e ano vão **abaixo** da imagem, no corpo do card. Contraste sobre capa arbitrária é indeterminado por definição — nenhuma medição vale, porque a imagem muda a cada filme. A única sobreposição permitida é a pílula de nota, que tem fundo âmbar **sólido e opaco** (nunca gradiente, nunca translucidez).
+
+Demais critérios, todos verificáveis:
+
+1. **`alt` do pôster = título do filme.** O placeholder de `poster_path` null tem `alt` próprio descrevendo a ausência, não `alt=""`
+2. **Chips de provedor são `<button>`** com `aria-pressed`, não `<div>` colorido — o estado ativo precisa existir para leitor de tela, não só para o olho
+3. **Anel de foco visível** em âmbar, 2 px com deslocamento, em todo elemento focável. Nunca `outline: none` sem substituto
+4. **Alvo de toque mínimo de 44 px** nos chips em tela pequena — é onde a barra de filtros é mais densa
+5. **`prefers-reduced-motion` respeitado** no shimmer do skeleton e em qualquer transição
+6. **Navegação por teclado completa**: cards são links, a grade é percorrível na ordem visual, e o modal não existe (§4.2), o que elimina a classe inteira de problemas de armadilha de foco
+
+O tema é **exclusivamente escuro** — não há alternância clara, e `prefers-color-scheme` não é consultado. É escolha deliberada de produto, não omissão.
 
 ---
 
@@ -328,6 +358,7 @@ O tema escolhido compromete o produto com as duas construções de maior risco d
 | Chave de monetização ausente | Null-check. A API só inclui a chave quando há oferta |
 | `localStorage` indisponível | Watchlist degrada para memória de sessão, com aviso |
 | Falha parcial no detalhe | São **duas** chamadas. Se as ofertas falharem, renderizar o filme sem elas |
+| Falha na anotação da busca | As até 10 chamadas de disponibilidade são independentes. A que falhar deixa aquele resultado sem selo — nunca derruba a lista nem bloqueia a renderização dos demais. Sem selo, o item cai no grupo "fora dos seus serviços" e o card diz "disponibilidade não verificada", em vez de afirmar ausência |
 | Resultado vazio | Estado vazio explícito, com sugestão de afrouxar filtros |
 | Requisição em andamento | Skeleton na proporção 2:3, via `loading.tsx` + `Suspense`. O chip clicado fica em estado pendente até a navegação concluir — com backoff de até 3 tentativas no 429, isso pode levar segundos, e a tela não pode ficar congelada sem sinal |
 
@@ -345,6 +376,7 @@ O tema escolhido compromete o produto com as duas construções de maior risco d
 - `lib/tmdb/images` — montagem das três peças, nas três famílias de tamanho (pôster, backdrop, logo), incluindo a rejeição de `w500` como backdrop
 - `lib/watchlist` — migração de schema, cota estourada, `localStorage` ausente, JSON corrompido, `v` desconhecido
 - Casamento de provedor por conjunto de IDs
+- `lib/tmdb/search` — particionamento em "nos seus serviços" / "fora", corte da anotação no 10º resultado, e resultado sem selo caindo no grupo correto quando a chamada de disponibilidade falha
 
 ### 9.2 Integração
 
@@ -439,7 +471,7 @@ O catálogo de um provedor individual no Brasil cabe nesse limite. "Todos os fil
 
 Os três parâmetros de disponibilidade — `with_watch_providers`, `watch_region`, `with_watch_monetization_types` — pertencem ao `/discover`. Não há lookup reverso nos endpoints de watch provider: **`/discover/movie` é o único caminho prático para enumerar o catálogo de um provedor numa região.**
 
-É a razão estrutural de §3.7: a busca por título não tem como respeitar o filtro de serviços numa única chamada, e anotá-la resultado a resultado recairia no N+1 rejeitado em §3.5.
+É a razão estrutural de §3.7: a busca por título não tem como respeitar o filtro de serviços numa única chamada. A disponibilidade dos resultados de busca só existe por anotação item a item — que ali é aceitável, porque o conjunto é limitado a 10 e a ação é deliberada, ao contrário da grade com scroll infinito (§3.5).
 
 ---
 
