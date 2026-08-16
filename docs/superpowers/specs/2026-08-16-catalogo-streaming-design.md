@@ -111,7 +111,7 @@ Com TTL de 6 h em `/movie/{id}/watch/providers` (§4.3), buscas repetidas do mes
 
 **Limite explícito:** apenas os primeiros 10 resultados são anotados. Do 11º em diante o selo não aparece, e a UI diz isso — o usuário refina o termo. Silenciosamente não anotar seria pior do que admitir o corte.
 
-> **Pendência de verificação:** o endpoint `/3/search/movie` **não está coberto pela ficha técnica**. Seus parâmetros aceitos precisam ser verificados em fonte primária antes da implementação — ver §9.3 item 5 e §13 item 5. A decisão acima é sólida em qualquer cenário (mesmo que a busca aceitasse filtro por provedor, a semântica escolhida continua sendo a mais útil), mas o spec não afirma o que a ficha não sustenta.
+> **Verificado em 16/08/2026 (§9.3 item 5):** `/3/search/movie` **ignora silenciosamente** `watch_region` e `with_watch_providers` — 92 resultados para "matrix" com e sem os parâmetros, HTTP 200 nos dois casos. A premissa desta seção está confirmada: filtrar a busca por provedor é impossível numa chamada. `year` funciona (92 → 5 com `year=1999`) e pode entrar como refinamento futuro.
 
 ---
 
@@ -136,10 +136,8 @@ flowchart TD
     S -->|HTML| B
 
     B -->|"GET /filme/550"| D["Server Component: detalhe (SSR + ISR)"]
-    D --> T2["TMDB /movie/550?append_to_response=credits,videos"]
-    D --> T3["TMDB /movie/550/watch/providers"]
+    D --> T2["TMDB /movie/550 append=credits,videos,watch/providers"]
     T2 --> D
-    T3 --> D
     D -->|"HTML + OG tags"| B
 
     B -->|"GET /api/discover?page=2"| R["Route handler: scroll infinito"]
@@ -182,8 +180,8 @@ Modal seria mais barato, mas não tem URL, logo não existe para o buscador.
 | `/watch/providers/movie?watch_region=BR` | 24 h | Lista de provedores muda raramente |
 | `/discover/movie` | 1 h | Equilíbrio entre frescor e volume de chamadas |
 | `/search/movie` | 1 h | Mesmo perfil de volatilidade da grade |
-| `/movie/{id}` | 24 h | Metadados, elenco e trailer mudam pouco — vêm na mesma resposta |
-| `/movie/{id}/watch/providers` | 6 h | Disponibilidade é o dado mais volátil |
+| `/movie/{id}` (com append) | 6 h | Metadados aceitariam 24 h, mas a resposta carrega disponibilidade junto — o dado mais volátil manda no TTL |
+| `/movie/{id}/watch/providers` | 6 h | Chamada isolada, usada só pela anotação da busca (§3.7) |
 
 Implementado via `revalidate` do Next (Vercel Data Cache).
 
@@ -201,13 +199,18 @@ Implementado via `revalidate` do Next (Vercel Data Cache).
 |---|---|---|
 | `client.ts` | `fetchTmdb(path, params, opts)`. Header `Authorization: Bearer`, `language=pt-BR`, timeout, backoff no 429, erros tipados por `status_code` | — |
 | `discover.ts` | `discoverMovies(filtros, page)` → resultados normalizados + `totalPages` limitado a 500 | `client` |
-| `movie.ts` | `getMovie(id)` — chamada única com `append_to_response=credits,videos` (metadados + elenco + trailer); `getMovieProviders(id)` → ofertas do bucket `BR` | `client` |
+| `movie.ts` | `getMovie(id)` — **chamada única** com `append_to_response=credits,videos,watch/providers`: metadados, elenco, trailer e ofertas do bucket `BR`; `getMovieProviders(id)` → ofertas isoladas, usado pela anotação da busca | `client` |
 | `search.ts` | `searchMovies(termo, page)` → resultados normalizados, **anotados com disponibilidade** para os 10 primeiros via `getMovieProviders` em paralelo, e particionados em "nos seus serviços" / "fora" (§3.7) | `client`, `movie` |
 | `providers.ts` | `getBrProviders()` → lista viva ordenada por `display_priorities.BR` **ascendente — menor valor = posição mais alta** | `client` |
 | `images.ts` | `posterUrl(path, size)`, `backdropUrl(path, size)`, `logoUrl(path, size)` a partir de `secure_base_url` | `client` |
 | `types.ts` | Tipos do domínio (`Filme`, `Oferta`, `Provedor`) — não tipos crus da API | — |
 
-**Sobre o `append_to_response` em `getMovie`:** `credits` e `videos` são sub-requests do mesmo namespace, e `videos` é o exemplo literal da documentação. A página de detalhe continua sendo **duas** chamadas HTTP. Isso **não** vale para `watch/providers`, que segue em chamada separada até o teste de contrato rodar (§9.3 item 3). O suporte a `credits` é suposição — ver §9.3 item 4.
+**Sobre o `append_to_response` em `getMovie` — verificado em 16/08/2026 contra a API ao vivo (§9.3):** `credits`, `videos` e `watch/providers` são todos aceitos, e o bucket `BR` vindo pelo append é **byte-idêntico** ao do endpoint direto. A página de detalhe é portanto **uma única chamada HTTP**, não duas.
+
+Duas consequências:
+
+- **O TTL da chamada combinada é 6 h**, não 24 h (§4.3). Metadados aceitariam 24 h, mas disponibilidade não — e ao juntar tudo numa resposta, o mais volátil manda. Ainda assim é menos tráfego que duas chamadas separadas
+- **Trailer exige atenção ao idioma.** Com `language=pt-BR`, o teste devolveu 1 trailer; sem o parâmetro, 3. Usar `include_video_language=pt,en,null` para não perder o trailer quando não houver versão em português
 
 **Autenticação:** header `Authorization: Bearer <TMDB_READ_TOKEN>`. É o método documentado como padrão pelo TMDB e o único presente no OpenAPI oficial. Não usar o parâmetro `api_key` na query string — funciona igual, mas vaza em log de proxy, CDN e `Referer`.
 
@@ -221,7 +224,7 @@ Puro, sem I/O. É a camada de maior risco de regressão silenciosa e a mais fác
 **Regras que vivem aqui:**
 
 - Provedores usam **pipe (`|`) = OR**. Vírgula significaria "está na Netflix **e** no Prime ao mesmo tempo", que casa com quase nada
-- `watch_region=BR` é sempre incluído. **Enviar `with_watch_providers` sem `watch_region` devolve resultados não filtrados, silenciosamente, com HTTP 200** — é o modo de falha mais perigoso da API
+- `watch_region=BR` é sempre incluído. **Enviar `with_watch_providers` sem `watch_region` devolve resultados não filtrados, silenciosamente, com HTTP 200.** Medido em 16/08/2026: **1.169.919 resultados sem a região contra 4.891 com ela**. É o modo de falha mais perigoso da API, porque não falha — entrega o catálogo global parecendo sucesso
 - `page` é limitado a 500 antes de qualquer chamada
 - **Valor inválido é descartado e cai no default**, nunca gera erro. Vale para todos os parâmetros: `ordem` desconhecida vira `popularidade`, `ano` fora de faixa é ignorado, `servicos` com id não numérico é descartado. Uma URL vinda de link antigo ou adulterada renderiza a grade, não uma tela de erro
 - **Home sem `servicos`**: nenhum filtro de provedor é aplicado — a grade mostra o catálogo geral do TMDB para o Brasil. Ausência de parâmetro significa "sem filtro", como em todos os demais campos
@@ -275,7 +278,7 @@ Qualquer outro valor é descartado e cai no default (§5.2). O vocabulário é f
 
 - `link` — URL da página `/watch` do próprio TMDB (não é deep link do provedor)
 - `flatrate`, `rent`, `buy`, `ads` — **presentes apenas quando há oferta daquele tipo**. Null-check obrigatório em cada chave
-- `free` é valor válido de `with_watch_monetization_types`, mas **não aparece como chave** no exemplo oficial da documentação (95 buckets de país; o bucket BR de Fight Club traz apenas `{link, flatrate}`). Ler `free` defensivamente junto com `ads`, e nunca inferir ausência de disponibilidade a partir da ausência de uma chave conhecida — ver §9.3 item 6
+- **`free` existe e é comum no Brasil** — verificado em 16/08/2026: 3.052 títulos casam por `with_watch_monetization_types=free` em BR, e buckets reais trazem combinações como `{link, free, flatrate, rent}` e `{link, ads, free}`. O exemplo da documentação (Fight Club) simplesmente não tinha oferta gratuita; a ausência ali não era regra. Ler `free` como chave de primeira classe, ao lado de `flatrate` e `ads`
 - Cada provedor traz 4 campos: `provider_id`, `provider_name`, `logo_path`, `display_priority`
 
 ### 6.3 Provedores
@@ -284,8 +287,30 @@ Obtidos de `/watch/providers/movie?watch_region=BR`. **Nunca fixados em código.
 
 Dois motivos concretos:
 
-- **HBO Max** aparece como `384` no exemplo da documentação, mas a lista viva do BR traz `1899` — e `384` não aparece nela. A observação vem da página de browse da TMDB, não de chamada direta à API; confirmar via API (§9.3 item 2)
-- **Amazon Prime Video** tem dois IDs (`9` e `119`), com o mesmo `logo_path`
+**Lista real do Brasil, verificada em 16/08/2026** — exatamente **85 provedores**, ordenados por `display_priorities.BR`:
+
+| Prioridade | ID | Provedor |
+|---|---|---|
+| 0 | `8` | Netflix |
+| 1 | `119` | Amazon Prime Video |
+| 2 | `350` | Apple TV |
+| 3 | `337` | Disney Plus |
+| 5 | `167` | Claro video |
+| 6 | `47` | Looke |
+| 7 | `531` | Paramount Plus |
+| 8 | `1899` | **HBO Max** |
+| 9 | `2` | Apple TV Store |
+| 10 | `307` | Globoplay |
+| 11 | `283` | Crunchyroll |
+| 12 | `11` | MUBI |
+
+O que a verificação corrigiu em relação à documentação:
+
+- **HBO Max é `1899`.** O `384` da documentação **não existe** na lista brasileira. Fixá-lo no código produziria uma prateleira vazia
+- **Prime Video é `119` apenas.** O `9` citado na ficha **não aparece** em BR
+- **A nomenclatura da Apple inverteu:** hoje `350` é "Apple TV" (assinatura) e `2` é "Apple TV Store" (transacional). A ficha registrava o oposto. Um chip de assinatura montado sobre `2` traria catálogo de aluguel
+- **Existem variantes "with Ads" com ID próprio:** `1796` = Netflix Standard with Ads, `2100` = Amazon Prime Video with Ads. São a mesma marca comercial com outro `provider_id`
+- **Telecine só existe como revenda:** `2156` = "Telecine Amazon Channel". Não há Telecine autônomo
 
 **Regra:** o casamento marca↔provedor é feito por **conjunto de IDs**, nunca por ID único.
 
@@ -357,7 +382,8 @@ O tema é **exclusivamente escuro** — não há alternância clara, e `prefers-
 | Sem bucket `BR` em watch/providers | "Sem disponibilidade em streaming no Brasil" — é informação, não falha |
 | Chave de monetização ausente | Null-check. A API só inclui a chave quando há oferta |
 | `localStorage` indisponível | Watchlist degrada para memória de sessão, com aviso |
-| Falha parcial no detalhe | São **duas** chamadas. Se as ofertas falharem, renderizar o filme sem elas |
+| Falha no detalhe | É **uma** chamada com append (§5.1) — ou vem tudo, ou não vem nada. Não existe estado parcial entre metadados e ofertas. Falha total cai no tratamento de erro da rota |
+| Sub-recurso vazio no detalhe | O append pode devolver `credits` sem elenco ou `videos` sem trailer. Cada bloco da página some individualmente, sem derrubar os demais |
 | Falha na anotação da busca | As até 10 chamadas de disponibilidade são independentes. A que falhar deixa aquele resultado sem selo — nunca derruba a lista nem bloqueia a renderização dos demais. Sem selo, o item cai no grupo "fora dos seus serviços" e o card diz "disponibilidade não verificada", em vez de afirmar ausência |
 | Resultado vazio | Estado vazio explícito, com sugestão de afrouxar filtros |
 | Requisição em andamento | Skeleton na proporção 2:3, via `loading.tsx` + `Suspense`. O chip clicado fica em estado pendente até a navegação concluir — com backoff de até 3 tentativas no 429, isso pode levar segundos, e a tela não pode ficar congelada sem sinal |
@@ -384,17 +410,21 @@ Rotas com TMDB mockado por **fixtures capturadas de resposta real**, não invent
 
 ### 9.3 Teste de contrato — roda sob demanda, fora do CI, com chave real
 
-Existe para converter em fato o que hoje é suposição. Os itens 1, 3, 4, 5, 6 e 7 estão marcados como não verificados na ficha técnica; o item 2 está confirmado por observação da página de browse BR, mas **não** por chamada direta à API.
+**Executado em 16/08/2026 contra a API ao vivo. Os sete itens estão resolvidos** — nenhuma suposição permanece no caminho crítico.
 
-1. **20 resultados por página** — comportamento observado, não documentado. O teto de ~10.000 resultados deriva dele
-2. **`provider_id` do HBO Max vivo em BR** — `384` (doc) vs `1899` (browse)
-3. **`append_to_response=watch/providers`** — não documentado; há relato de divergência com o endpoint direto. Se passar, reduz a página de detalhe de duas chamadas para uma
-4. **`credits` e `videos` como valores de `append_to_response`** em `/movie/{id}` — a documentação só exemplifica `videos` e `videos,images`. Se `credits` reprovar, o detalhe vira três chamadas e a linha "falha parcial" do §8 ganha uma terceira dimensão
-5. **Parâmetros aceitos por `/3/search/movie`** — o endpoint **não está coberto pela ficha técnica**. Verificar antes de implementar §3.7, e acrescentar o resultado à ficha
-6. **A chave `free` aparece no bucket BR** de um título casado por `with_watch_monetization_types=free`?
-7. **Semântica da vírgula (`AND`)** em `with_watch_providers`
+| # | Pergunta | Resultado |
+|---|---|---|
+| 1 | 20 resultados por página? | **Sim.** Netflix BR = 4.891 títulos em 245 páginas, dentro do teto de 500 |
+| 2 | `provider_id` vivo do HBO Max em BR | **`1899`.** `384` não existe em BR. Lista completa e correções em §6.3 |
+| 3 | `append_to_response=watch/providers` funciona? | **Sim**, e o bucket `BR` é idêntico ao do endpoint direto. Detalhe vira uma chamada |
+| 4 | `credits` e `videos` no append? | **Sim.** 76 pessoas no elenco de teste. Trailer exige `include_video_language` (§5.1) |
+| 5 | `/search/movie` aceita filtro por provedor? | **Não.** `watch_region` e `with_watch_providers` são **ignorados silenciosamente** — 92 resultados com e sem. `year` funciona. Confirma a premissa de §3.7 |
+| 6 | A chave `free` aparece no bucket BR? | **Sim**, e é comum: 3.052 títulos em BR. Ver §6.2 |
+| 7 | Vírgula é `AND`? | **Sim.** Netflix 4.891, Prime 4.359, `8\|119` = 9.130 (união), `8,119` = 124 (interseção). Ambos funcionam como documentado |
 
-Enquanto este teste não rodar, esses pontos permanecem suposição, e o código assume o caminho conservador (chamada separada para ofertas, provedores lidos da API, chaves de monetização lidas defensivamente).
+**Achado extra, o mais perigoso de todos:** `with_watch_providers=8` **sem** `watch_region` devolve HTTP 200 com **1.169.919 resultados** — o catálogo global inteiro, filtro silenciosamente descartado. Contra 4.891 com `watch_region=BR`. É o modo de falha que a §5.2 previne, agora medido: errar isso não gera erro, gera um site que parece funcionar e mostra o catálogo errado.
+
+**Este teste vira suíte permanente**, executada sob demanda contra a API real. Os valores acima não são constantes — o catálogo muda, provedores entram e saem. O que a suíte protege são as **invariantes**: `watch_region` obrigatório, pipe é união, vírgula é interseção, o append traz as três coisas, e a busca ignora filtro de provedor.
 
 ### 9.4 E2E (Playwright)
 
@@ -502,10 +532,10 @@ Domínio `ondeassisto.com.br` apontado nas configurações do projeto. Plano Hob
 | # | Item | Tipo | Responsável |
 |---|---|---|---|
 | 1 | ~~Regerar o `TMDB_READ_TOKEN`~~ — **resolvido em 16/08/2026.** Token novo autentica (HTTP 200); o anterior retorna HTTP 401 / `status_code 7` | — | concluído |
-| 2 | Rodar o teste de contrato (§9.3). **Item 1 confirmado em 16/08/2026** contra a API ao vivo: 20 resultados por página; Netflix BR = 4.891 títulos em 245 páginas, dentro do teto de 500. Restam os itens 2 a 7 | `[ADAPTAR]` | implementação |
+| 2 | ~~Rodar o teste de contrato (§9.3)~~ — **resolvido em 16/08/2026.** Os sete itens verificados contra a API ao vivo; resultados e correções incorporados a §5.1, §6.2, §6.3, §8 e §9.3 | — | concluído |
 | 3 | Escolher a fonte tipográfica do tema escuro | `[DECIDIR]` | implementação |
 | 4 | Definir o conjunto inicial de provedores destacados na UI, a partir de `display_priorities.BR` | `[ADAPTAR]` | implementação |
-| 5 | Verificar `/3/search/movie` em fonte primária e acrescentá-lo à ficha técnica — hoje é o único endpoint usado pelo spec que a ficha não cobre | `[ADAPTAR]` | implementação |
+| 5 | ~~Verificar `/3/search/movie`~~ — **resolvido em 16/08/2026.** Ignora filtro por provedor; `year` funciona. Registrado em §3.7 e §9.3 | — | concluído |
 | 6 | Decidir o agrupamento marca↔IDs: revendas ("Telecine Amazon Channel") entram no chip da marca-mãe? "Apple TV" e "Apple TV Plus" são o mesmo chip? Transacionais puros ficam fora, por coerência com §3.3? | `[DECIDIR]` | Mauricio |
 
 ---
